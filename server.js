@@ -1,12 +1,13 @@
 console.log('🚀 Starting MeterFlow Backend...');
-const PORT = process.env.PORT || 6005;
+
+require('dotenv').config();
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const Redis = require('ioredis');
-require('dotenv').config();
 
 // Import routes
 const authRoutes = require('./src/routes/authRoutes');
@@ -17,122 +18,105 @@ const adminRoutes = require('./src/routes/adminRoutes');
 const consumerRoutes = require('./src/routes/consumerRoutes');
 const paymentRoutes = require('./src/routes/paymentRoutes');
 
-// Import gateway middleware
+// Gateway middleware
 const { gatewayMiddleware, proxyMiddleware } = require('./src/middleware/apiGateway');
 
 const app = express();
 
-// ==================== REDIS CONNECTION (with fallback) ====================
-let redisClient = null;
-let redisAvailable = false;
+// ✅ FIX 1: Correct PORT
+const PORT = process.env.PORT || 5000;
 
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+// ==================== REDIS SETUP ====================
+global.redisClient = null;
+global.redisAvailable = false;
+
+const REDIS_URL = process.env.REDIS_URL; // ❗ remove localhost fallback
 
 const initRedis = async () => {
+  if (!REDIS_URL) {
+    console.warn('⚠️ No REDIS_URL provided → using in-memory fallback');
+    return;
+  }
+
   try {
-    redisClient = new Redis(REDIS_URL, {
-      lazyConnect: true,               // Don't connect on instantiation
-      retryStrategy: (times) => {
-        if (times > 5) {
-          console.error(`❌ Redis connection failed after ${times} attempts. Continuing without Redis.`);
-          redisAvailable = false;
-          return null; // Stop retrying
-        }
-        const delay = Math.min(times * 100, 3000);
-        console.log(`🔄 Redis reconnecting in ${delay}ms (attempt ${times}/5)`);
-        return delay;
-      },
-      maxRetriesPerRequest: 3,
-      enableAutoPipelining: true,
-      showFriendlyErrorStack: process.env.NODE_ENV !== 'production',
+    const redis = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 2,
+      retryStrategy: (times) => Math.min(times * 100, 3000),
     });
 
-    // Event handlers
-    redisClient.on('connect', () => {
-      console.log('✅ Redis connection established');
+    redis.on('connect', () => {
+      console.log('✅ Redis connected');
     });
 
-    redisClient.on('ready', () => {
-      console.log('✅ Redis client ready and authenticated');
-      redisAvailable = true;
+    redis.on('ready', () => {
+      console.log('✅ Redis ready');
+      global.redisAvailable = true;
     });
 
-    redisClient.on('error', (err) => {
-      if (redisAvailable) {
-        console.error('❌ Redis runtime error:', err.message);
-      }
-      redisAvailable = false;
+    redis.on('error', (err) => {
+      console.error('❌ Redis error:', err.message);
+      global.redisAvailable = false;
     });
 
-    redisClient.on('close', () => {
-      if (redisAvailable) console.warn('⚠️ Redis connection closed');
-      redisAvailable = false;
+    redis.on('close', () => {
+      console.warn('⚠️ Redis connection closed');
+      global.redisAvailable = false;
     });
 
-    redisClient.on('reconnecting', () => {
-      console.log('🔄 Redis reconnecting...');
-    });
+    // Test connection
+    await redis.ping();
 
-    // Attempt connection
-    await redisClient.connect();
-    // Verify with ping
-    const pong = await redisClient.ping();
-    if (pong === 'PONG') {
-      console.log('✅ Redis ping successful');
-      redisAvailable = true;
-    } else {
-      throw new Error('Unexpected redis ping response');
-    }
+    global.redisClient = redis;
+    global.redisAvailable = true;
+
+    console.log('✅ Redis fully initialized');
+
   } catch (err) {
-    console.warn('⚠️ Redis not available, using in-memory fallback. Error:', err.message);
-    redisAvailable = false;
-    redisClient = null;
+    console.warn('⚠️ Redis unavailable → fallback mode:', err.message);
+    global.redisAvailable = false;
+    global.redisClient = null;
   }
 };
 
-// Make Redis client available globally for other modules (e.g., apiGateway)
-global.redisClient = redisClient;
-global.redisAvailable = redisAvailable;
-
-// Call Redis init (non‑blocking)
+// Initialize Redis (non-blocking)
 initRedis();
 
-// ==================== EXPRESS MIDDLEWARE & ROUTES ====================
+// ==================== MIDDLEWARE ====================
+app.use(helmet());
 
-// Root route
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true,
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key']
+}));
+
+app.use(express.json());
+app.use(morgan('combined'));
+
+// ==================== ROUTES ====================
+
+// Root
 app.get('/', (req, res) => {
   res.json({
     name: 'MeterFlow API',
     version: '1.0.0',
-    status: 'healthy',
-    endpoints: {
-      health: '/health',
-      api: '/api',
-      gateway: '/gateway'
-    }
+    status: 'healthy'
   });
 });
 
-// Security & utility middleware
-app.use(helmet());
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:3001'],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key']
-}));
-app.use(express.json());
-app.use(morgan('combined'));
-
-// Health check
+// Health
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date(), uptime: process.uptime() });
+  res.json({
+    status: 'OK',
+    uptime: process.uptime(),
+    redis: global.redisAvailable ? 'connected' : 'fallback'
+  });
 });
 
-// Gateway endpoints
+// Gateway
 app.use('/gateway/*', gatewayMiddleware, proxyMiddleware);
 
-// API Routes
+// APIs
 app.use('/api/auth', authRoutes);
 app.use('/api/apis', apiRoutes);
 app.use('/api/billing', billingRoutes);
@@ -141,34 +125,36 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/consumer', consumerRoutes);
 app.use('/api/payments', paymentRoutes);
 
-// Error handling
+// ==================== ERROR HANDLING ====================
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  console.error('❌ Error:', err);
   res.status(500).json({ error: err.message });
 });
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// ==================== MONGODB CONNECTION & SERVER START ====================
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/meterflow', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
+// ==================== MONGODB + SERVER ====================
+mongoose.connect(
+  process.env.MONGODB_URI || 'mongodb://localhost:27017/meterflow',
+  {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  }
+)
 .then(() => {
-  console.log('✅ MongoDB connected successfully');
-  app.listen(PORT, () => {
-    console.log(`🚀 MeterFlow server running on port ${PORT}`);
-    console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`📊 Redis status: ${redisAvailable ? '✅ connected' : '⚠️ fallback mode (in‑memory)'}`);
+  console.log('✅ MongoDB connected');
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`📊 Redis: ${global.redisAvailable ? '✅ connected' : '⚠️ fallback mode'}`);
   });
 })
 .catch(err => {
-  console.error('❌ MongoDB connection error:', err);
+  console.error('❌ MongoDB connection failed:', err);
   process.exit(1);
 });
 
-// Export for testing
-module.exports = { app, redisClient, redisAvailable };
+module.exports = { app };
