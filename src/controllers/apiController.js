@@ -239,7 +239,6 @@ const revokeApiKey = async (req, res) => {
     
     // Clear from Redis cache
     const Redis = require('ioredis');
-    const redis = new Redis(process.env.REDIS_URL);
     await redis.del(`api_key:${apiKey.key}`);
     
     res.json({
