@@ -4,21 +4,10 @@ const Api = require('../models/Api');
 const UsageLog = require('../models/UsageLog');
 const Billing = require('../models/Billing');
 const moment = require('moment');
+const axios = require('axios');
 
-// --- In-Memory Cache Fallback (used when Redis is not available) ---
+// --- In-Memory Cache Fallback ---
 const memoryCache = new Map();
-
-// --- Use the shared Redis client from server.js ---
-// The server.js file sets global.redisClient and global.redisAvailable.
-// If those are not defined (e.g., in a standalone test), we fall back gracefully.
-let redis = global.redisClient || null;
-let redisAvailable = global.redisAvailable || false;
-
-if (!redisAvailable) {
-  console.log('⚠️ apiGateway: Redis not available, using in‑memory cache fallback.');
-} else {
-  console.log('✅ apiGateway: Using shared Redis client.');
-}
 
 class APIGateway {
   constructor() {
@@ -26,30 +15,40 @@ class APIGateway {
     this.keyCachePrefix = 'api_key:';
   }
 
+  // ✅ Always fetch latest Redis state (FIXED)
+  getRedis() {
+    return {
+      redis: global.redisClient || null,
+      redisAvailable: global.redisAvailable || false
+    };
+  }
+
+  // -------------------------------
+  // 🔐 API KEY VALIDATION + CACHE
+  // -------------------------------
   async validateApiKey(apiKey) {
+    const { redis, redisAvailable } = this.getRedis();
     const cacheKey = `${this.keyCachePrefix}${apiKey}`;
-    
-    // Try cache (Redis or in-memory)
+
+    // 🔹 Try Redis cache
     if (redisAvailable && redis) {
       try {
         const cached = await redis.get(cacheKey);
         if (cached) return JSON.parse(cached);
       } catch (err) {
-        // ignore redis error, fall back to DB
+        console.warn('Redis read failed, fallback to DB');
       }
     } else {
+      // 🔹 Memory fallback
       const cached = memoryCache.get(cacheKey);
-      if (cached && cached.expiry > Date.now()) {
-        return cached.data;
-      } else if (cached) {
-        memoryCache.delete(cacheKey);
-      }
+      if (cached && cached.expiry > Date.now()) return cached.data;
+      if (cached) memoryCache.delete(cacheKey);
     }
 
-    // Fetch from database on cache miss
+    // 🔹 DB lookup
     const keyDoc = await ApiKey.findOne({ key: apiKey, status: 'active' })
       .populate('apiId');
-    
+
     if (!keyDoc) return null;
     if (keyDoc.expiresAt && keyDoc.expiresAt < new Date()) return null;
 
@@ -67,59 +66,93 @@ class APIGateway {
       }
     };
 
-    const ttl = 300; // 5 minutes
+    const ttl = 300;
+
+    // 🔹 Store in Redis
     if (redisAvailable && redis) {
       try {
         await redis.setex(cacheKey, ttl, JSON.stringify(keyData));
       } catch (err) {
-        // fall back to memory if redis write fails
-        memoryCache.set(cacheKey, { data: keyData, expiry: Date.now() + (ttl * 1000) });
+        console.warn('Redis write failed, using memory cache');
+        memoryCache.set(cacheKey, {
+          data: keyData,
+          expiry: Date.now() + ttl * 1000
+        });
       }
     } else {
-      memoryCache.set(cacheKey, { data: keyData, expiry: Date.now() + (ttl * 1000) });
+      memoryCache.set(cacheKey, {
+        data: keyData,
+        expiry: Date.now() + ttl * 1000
+      });
     }
+
     return keyData;
   }
 
+  // -------------------------------
+  // 🚦 RATE LIMITING
+  // -------------------------------
   async checkRateLimit(keyId, consumerId, limits) {
-    // If Redis is not available, skip rate limiting entirely.
-    if (!redisAvailable || !redis) return { allowed: true };
+    const { redis, redisAvailable } = this.getRedis();
+    const now = Date.now();
 
-    const now = new Date();
-    const minuteKey = `${this.rateLimitPrefix}${keyId}:minute:${Math.floor(now.getTime() / 60000)}`;
-    const hourKey = `${this.rateLimitPrefix}${keyId}:hour:${Math.floor(now.getTime() / 3600000)}`;
-    const dayKey = `${this.rateLimitPrefix}${keyId}:day:${Math.floor(now.getTime() / 86400000)}`;
+    // ✅ Redis-based (Primary)
+    if (redisAvailable && redis) {
+      try {
+        const minuteKey = `${this.rateLimitPrefix}${keyId}:m:${Math.floor(now / 60000)}`;
+        const hourKey = `${this.rateLimitPrefix}${keyId}:h:${Math.floor(now / 3600000)}`;
+        const dayKey = `${this.rateLimitPrefix}${keyId}:d:${Math.floor(now / 86400000)}`;
 
-    try {
-      const [minuteCount, hourCount, dayCount] = await Promise.all([
-        redis.incr(minuteKey),
-        redis.incr(hourKey),
-        redis.incr(dayKey)
-      ]);
-      if (minuteCount === 1) await redis.expire(minuteKey, 60);
-      if (hourCount === 1) await redis.expire(hourKey, 3600);
-      if (dayCount === 1) await redis.expire(dayKey, 86400);
+        const [m, h, d] = await Promise.all([
+          redis.incr(minuteKey),
+          redis.incr(hourKey),
+          redis.incr(dayKey)
+        ]);
 
-      if (minuteCount > limits.perMinute)
-        return { allowed: false, limit: 'perMinute', retryAfter: 60 };
-      if (hourCount > limits.perHour)
-        return { allowed: false, limit: 'perHour', retryAfter: 3600 };
-      if (dayCount > limits.perDay)
-        return { allowed: false, limit: 'perDay', retryAfter: 86400 };
-    } catch (err) {
-      console.warn('⚠️ Rate limit check failed, allowing request:', err.message);
+        if (m === 1) await redis.expire(minuteKey, 60);
+        if (h === 1) await redis.expire(hourKey, 3600);
+        if (d === 1) await redis.expire(dayKey, 86400);
+
+        if (m > limits.perMinute)
+          return { allowed: false, limit: 'perMinute', retryAfter: 60 };
+        if (h > limits.perHour)
+          return { allowed: false, limit: 'perHour', retryAfter: 3600 };
+        if (d > limits.perDay)
+          return { allowed: false, limit: 'perDay', retryAfter: 86400 };
+
+      } catch (err) {
+        console.warn('Redis rate limit failed → fallback memory');
+      }
     }
+
+    // ⚠️ Memory fallback (NEW FIX)
+    const fallbackKey = `${keyId}:${Math.floor(now / 60000)}`;
+    const count = memoryCache.get(fallbackKey) || 0;
+
+    if (count >= limits.perMinute) {
+      return { allowed: false, limit: 'perMinute', retryAfter: 60 };
+    }
+
+    memoryCache.set(fallbackKey, count + 1);
+
     return { allowed: true };
   }
 
+  // -------------------------------
+  // 📊 LOGGING + BILLING
+  // -------------------------------
   async logRequestAndGenerateBill(logData) {
     try {
       const log = new UsageLog(logData);
       await log.save();
-      await ApiKey.findByIdAndUpdate(logData.apiKey, { lastUsedAt: new Date() });
+
+      await ApiKey.findByIdAndUpdate(logData.apiKey, {
+        lastUsedAt: new Date()
+      });
+
       await this.updateBillingRecord(logData);
     } catch (error) {
-      console.error('Error logging request:', error);
+      console.error('Logging error:', error);
     }
   }
 
@@ -127,28 +160,29 @@ class APIGateway {
     try {
       const periodStart = moment().startOf('month').toDate();
       const periodEnd = moment().endOf('month').toDate();
+
       const api = await Api.findById(logData.apiId);
       if (!api) return;
-      
+
       const freeTier = api.pricing?.freeTier || 1000;
       const perRequestPrice = api.pricing?.perRequestPrice || 0.001;
-      
+
       const totalRequests = await UsageLog.countDocuments({
         consumerId: logData.consumerId,
         apiId: logData.apiId,
         timestamp: { $gte: periodStart, $lte: periodEnd }
       });
-      
+
       const paidRequests = Math.max(0, totalRequests - freeTier);
       const amount = paidRequests * perRequestPrice;
-      
+
       let billing = await Billing.findOne({
         consumerId: logData.consumerId,
         apiId: logData.apiId,
         'period.start': periodStart,
         'period.end': periodEnd
       });
-      
+
       if (!billing) {
         billing = new Billing({
           consumerId: logData.consumerId,
@@ -159,7 +193,7 @@ class APIGateway {
           amount: parseFloat(amount.toFixed(2)),
           currency: api.pricing?.currency || 'USD',
           status: amount > 0 ? 'pending' : 'paid',
-          dueDate: amount > 0 ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) : null,
+          dueDate: amount > 0 ? new Date(Date.now() + 7 * 86400000) : null,
           paidAt: amount === 0 ? new Date() : null
         });
       } else {
@@ -169,22 +203,26 @@ class APIGateway {
         billing.status = amount > 0 ? 'pending' : 'paid';
         if (amount === 0) billing.paidAt = new Date();
       }
+
       await billing.save();
     } catch (error) {
-      console.error('Error updating billing:', error);
+      console.error('Billing error:', error);
     }
   }
 
-  async forwardRequest(targetUrl, reqBody, headers, method) {
-    const axios = require('axios');
+  // -------------------------------
+  // 🔁 REQUEST FORWARDING
+  // -------------------------------
+  async forwardRequest(targetUrl, body, headers, method) {
     try {
       const response = await axios({
         method,
         url: targetUrl,
-        data: reqBody,
+        data: body,
         headers: { ...headers, 'x-forwarded-by': 'MeterFlow-Gateway' },
         timeout: 30000
       });
+
       return response;
     } catch (error) {
       return error.response || { status: 500, data: { error: 'Gateway error' } };
@@ -192,47 +230,76 @@ class APIGateway {
   }
 }
 
+// -------------------------------
+// 🚪 MIDDLEWARES
+// -------------------------------
 const gatewayMiddleware = async (req, res, next) => {
   const gateway = new APIGateway();
+
   try {
     const apiKey = req.headers['x-api-key'];
     if (!apiKey) return res.status(401).json({ error: 'API key required' });
 
     const keyData = await gateway.validateApiKey(apiKey);
-    if (!keyData) return res.status(401).json({ error: 'Invalid or inactive API key' });
+    if (!keyData)
+      return res.status(401).json({ error: 'Invalid API key' });
 
-    const rateLimitCheck = await gateway.checkRateLimit(keyData.id, keyData.consumerId, keyData.rateLimit);
-    if (!rateLimitCheck.allowed) {
+    const rateLimit = await gateway.checkRateLimit(
+      keyData.id,
+      keyData.consumerId,
+      keyData.rateLimit
+    );
+
+    if (!rateLimit.allowed) {
       return res.status(429).json({
-        error: `Rate limit exceeded (${rateLimitCheck.limit})`,
-        retryAfter: rateLimitCheck.retryAfter
+        error: `Rate limit exceeded (${rateLimit.limit})`,
+        retryAfter: rateLimit.retryAfter
       });
     }
 
     req.gateway = { keyData, apiKey, startTime: Date.now() };
     next();
-  } catch (error) {
-    console.error('Gateway error:', error);
-    res.status(500).json({ error: 'Gateway processing error' });
+  } catch (err) {
+    console.error('Gateway error:', err);
+    res.status(500).json({ error: 'Gateway error' });
   }
 };
 
 const proxyMiddleware = async (req, res) => {
   const gateway = new APIGateway();
   const { keyData, apiKey, startTime } = req.gateway;
+
   const targetUrl = `${keyData.baseUrl}${req.originalUrl}`;
-  const response = await gateway.forwardRequest(targetUrl, req.body, req.headers, req.method);
+
+  const response = await gateway.forwardRequest(
+    targetUrl,
+    req.body,
+    req.headers,
+    req.method
+  );
+
   const responseTime = Date.now() - startTime;
   const cost = keyData.pricing?.perRequestPrice || 0.001;
-  
+
   await gateway.logRequestAndGenerateBill({
-    apiKey, apiId: keyData.apiId, consumerId: keyData.consumerId,
-    endpoint: req.originalUrl, method: req.method, statusCode: response.status,
-    responseTime, ipAddress: req.ip, userAgent: req.headers['user-agent'], cost
+    apiKey,
+    apiId: keyData.apiId,
+    consumerId: keyData.consumerId,
+    endpoint: req.originalUrl,
+    method: req.method,
+    statusCode: response.status,
+    responseTime,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'],
+    cost
   });
-  
+
   res.setHeader('X-Request-Cost', `$${cost}`);
   res.status(response.status).json(response.data);
 };
 
-module.exports = { gatewayMiddleware, proxyMiddleware, APIGateway };
+module.exports = {
+  gatewayMiddleware,
+  proxyMiddleware,
+  APIGateway
+};
