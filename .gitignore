@@ -111,7 +111,6 @@ dump.rdb
 
 # MongoDB files
 *.bson
-*.json
 
 # PM2
 .pm2/
