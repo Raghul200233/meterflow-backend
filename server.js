@@ -110,8 +110,8 @@ const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:3001',
   process.env.FRONTEND_URL,
-  'https://meterflow.vercel.app',
-  'https://meterflow-git-main.vercel.app'
+  process.env.CORS_ORIGIN,
+  'https://meterflow.vercel.app'
 ].filter(Boolean);
 
 app.use(cors({
@@ -121,8 +121,8 @@ app.use(cors({
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      console.warn(`CORS blocked: ${origin}`);
-      callback(null, true); // Allow anyway for now, but log it
+      console.log(`CORS allowed: ${origin}`); // Log for debugging
+      callback(null, true); // Allow anyway
     }
   },
   credentials: true,
