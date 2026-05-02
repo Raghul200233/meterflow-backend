@@ -21,6 +21,20 @@ const { gatewayMiddleware, proxyMiddleware } = require('./src/middleware/apiGate
 
 const app = express();
 
+// Root route - API information
+app.get('/', (req, res) => {
+  res.json({
+    name: 'MeterFlow API',
+    version: '1.0.0',
+    status: 'healthy',
+    endpoints: {
+      health: '/health',
+      api: '/api',
+      gateway: '/gateway'
+    }
+  });
+});
+
 // Middleware
 app.use(helmet());
 app.use(cors({
