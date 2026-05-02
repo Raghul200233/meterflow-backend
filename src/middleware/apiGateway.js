@@ -1,4 +1,3 @@
-const Redis = require('ioredis');
 const crypto = require('crypto');
 const ApiKey = require('../models/ApiKey');
 const Api = require('../models/Api');
@@ -6,44 +5,20 @@ const UsageLog = require('../models/UsageLog');
 const Billing = require('../models/Billing');
 const moment = require('moment');
 
-// --- In-Memory Cache Fallback ---
+// --- In-Memory Cache Fallback (used when Redis is not available) ---
 const memoryCache = new Map();
 
-// --- Try to connect to Redis once, but don't crash if it fails ---
-let redis = null;
-let redisAvailable = false;
+// --- Use the shared Redis client from server.js ---
+// The server.js file sets global.redisClient and global.redisAvailable.
+// If those are not defined (e.g., in a standalone test), we fall back gracefully.
+let redis = global.redisClient || null;
+let redisAvailable = global.redisAvailable || false;
 
-console.log('🔄 Initializing cache service...');
-
-try {
-  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-  redis = new Redis(redisUrl, {
-    retryStrategy: (times) => {
-      if (times > 3) {
-        console.warn('⚠️ Redis not available after multiple attempts, switching to in-memory cache fallback.');
-        redisAvailable = false;
-        return null; // Stop retrying
-      }
-      return Math.min(times * 100, 3000);
-    },
-    maxRetriesPerRequest: 1,
-  });
-
-  redis.on('connect', () => {
-    console.log('✅ Redis cache connected successfully.');
-    redisAvailable = true;
-  });
-
-  redis.on('error', (err) => {
-    if (redisAvailable === false) return; // Avoid log spam
-    console.warn('⚠️ Redis connection error:', err.message);
-    redisAvailable = false;
-  });
-} catch (err) {
-  console.warn('⚠️ Redis unavailable, using in-memory fallback. Error:', err.message);
-  redisAvailable = false;
+if (!redisAvailable) {
+  console.log('⚠️ apiGateway: Redis not available, using in‑memory cache fallback.');
+} else {
+  console.log('✅ apiGateway: Using shared Redis client.');
 }
-// ---------------------------------
 
 class APIGateway {
   constructor() {
@@ -54,12 +29,14 @@ class APIGateway {
   async validateApiKey(apiKey) {
     const cacheKey = `${this.keyCachePrefix}${apiKey}`;
     
-    // Try to get from cache (Redis or In-Memory)
-    if (redisAvailable) {
+    // Try cache (Redis or in-memory)
+    if (redisAvailable && redis) {
       try {
         const cached = await redis.get(cacheKey);
         if (cached) return JSON.parse(cached);
-      } catch (err) {}
+      } catch (err) {
+        // ignore redis error, fall back to DB
+      }
     } else {
       const cached = memoryCache.get(cacheKey);
       if (cached && cached.expiry > Date.now()) {
@@ -69,7 +46,7 @@ class APIGateway {
       }
     }
 
-    // Fetch from DB on cache miss
+    // Fetch from database on cache miss
     const keyDoc = await ApiKey.findOne({ key: apiKey, status: 'active' })
       .populate('apiId');
     
@@ -90,22 +67,23 @@ class APIGateway {
       }
     };
 
-    // Store in cache
     const ttl = 300; // 5 minutes
-    if (redisAvailable) {
-      await redis.setex(cacheKey, ttl, JSON.stringify(keyData));
+    if (redisAvailable && redis) {
+      try {
+        await redis.setex(cacheKey, ttl, JSON.stringify(keyData));
+      } catch (err) {
+        // fall back to memory if redis write fails
+        memoryCache.set(cacheKey, { data: keyData, expiry: Date.now() + (ttl * 1000) });
+      }
     } else {
-      memoryCache.set(cacheKey, {
-        data: keyData,
-        expiry: Date.now() + (ttl * 1000)
-      });
+      memoryCache.set(cacheKey, { data: keyData, expiry: Date.now() + (ttl * 1000) });
     }
     return keyData;
   }
 
   async checkRateLimit(keyId, consumerId, limits) {
     // If Redis is not available, skip rate limiting entirely.
-    if (!redisAvailable) return { allowed: true };
+    if (!redisAvailable || !redis) return { allowed: true };
 
     const now = new Date();
     const minuteKey = `${this.rateLimitPrefix}${keyId}:minute:${Math.floor(now.getTime() / 60000)}`;
@@ -122,9 +100,12 @@ class APIGateway {
       if (hourCount === 1) await redis.expire(hourKey, 3600);
       if (dayCount === 1) await redis.expire(dayKey, 86400);
 
-      if (minuteCount > limits.perMinute) return { allowed: false, limit: 'perMinute', retryAfter: 60 };
-      if (hourCount > limits.perHour) return { allowed: false, limit: 'perHour', retryAfter: 3600 };
-      if (dayCount > limits.perDay) return { allowed: false, limit: 'perDay', retryAfter: 86400 };
+      if (minuteCount > limits.perMinute)
+        return { allowed: false, limit: 'perMinute', retryAfter: 60 };
+      if (hourCount > limits.perHour)
+        return { allowed: false, limit: 'perHour', retryAfter: 3600 };
+      if (dayCount > limits.perDay)
+        return { allowed: false, limit: 'perDay', retryAfter: 86400 };
     } catch (err) {
       console.warn('⚠️ Rate limit check failed, allowing request:', err.message);
     }

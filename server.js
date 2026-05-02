@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const Redis = require('ioredis');
 require('dotenv').config();
 
 // Import routes
@@ -21,7 +22,84 @@ const { gatewayMiddleware, proxyMiddleware } = require('./src/middleware/apiGate
 
 const app = express();
 
-// Root route - API information
+// ==================== REDIS CONNECTION (with fallback) ====================
+let redisClient = null;
+let redisAvailable = false;
+
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+
+const initRedis = async () => {
+  try {
+    redisClient = new Redis(REDIS_URL, {
+      lazyConnect: true,               // Don't connect on instantiation
+      retryStrategy: (times) => {
+        if (times > 5) {
+          console.error(`❌ Redis connection failed after ${times} attempts. Continuing without Redis.`);
+          redisAvailable = false;
+          return null; // Stop retrying
+        }
+        const delay = Math.min(times * 100, 3000);
+        console.log(`🔄 Redis reconnecting in ${delay}ms (attempt ${times}/5)`);
+        return delay;
+      },
+      maxRetriesPerRequest: 3,
+      enableAutoPipelining: true,
+      showFriendlyErrorStack: process.env.NODE_ENV !== 'production',
+    });
+
+    // Event handlers
+    redisClient.on('connect', () => {
+      console.log('✅ Redis connection established');
+    });
+
+    redisClient.on('ready', () => {
+      console.log('✅ Redis client ready and authenticated');
+      redisAvailable = true;
+    });
+
+    redisClient.on('error', (err) => {
+      if (redisAvailable) {
+        console.error('❌ Redis runtime error:', err.message);
+      }
+      redisAvailable = false;
+    });
+
+    redisClient.on('close', () => {
+      if (redisAvailable) console.warn('⚠️ Redis connection closed');
+      redisAvailable = false;
+    });
+
+    redisClient.on('reconnecting', () => {
+      console.log('🔄 Redis reconnecting...');
+    });
+
+    // Attempt connection
+    await redisClient.connect();
+    // Verify with ping
+    const pong = await redisClient.ping();
+    if (pong === 'PONG') {
+      console.log('✅ Redis ping successful');
+      redisAvailable = true;
+    } else {
+      throw new Error('Unexpected redis ping response');
+    }
+  } catch (err) {
+    console.warn('⚠️ Redis not available, using in-memory fallback. Error:', err.message);
+    redisAvailable = false;
+    redisClient = null;
+  }
+};
+
+// Make Redis client available globally for other modules (e.g., apiGateway)
+global.redisClient = redisClient;
+global.redisAvailable = redisAvailable;
+
+// Call Redis init (non‑blocking)
+initRedis();
+
+// ==================== EXPRESS MIDDLEWARE & ROUTES ====================
+
+// Root route
 app.get('/', (req, res) => {
   res.json({
     name: 'MeterFlow API',
@@ -35,7 +113,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Middleware
+// Security & utility middleware
 app.use(helmet());
 app.use(cors({
   origin: ['http://localhost:3000', 'http://localhost:3001'],
@@ -74,17 +152,17 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
 
-// MongoDB connection
-
+// ==================== MONGODB CONNECTION & SERVER START ====================
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/meterflow', {
   useNewUrlParser: true,
-  useUnifiedTopology: true
+  useUnifiedTopology: true,
 })
 .then(() => {
   console.log('✅ MongoDB connected successfully');
   app.listen(PORT, () => {
     console.log(`🚀 MeterFlow server running on port ${PORT}`);
     console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`📊 Redis status: ${redisAvailable ? '✅ connected' : '⚠️ fallback mode (in‑memory)'}`);
   });
 })
 .catch(err => {
@@ -92,4 +170,5 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/meterflow
   process.exit(1);
 });
 
-module.exports = app;
+// Export for testing
+module.exports = { app, redisClient, redisAvailable };
