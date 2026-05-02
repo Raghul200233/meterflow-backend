@@ -61,7 +61,6 @@ app.use((req, res) => {
 });
 
 // MongoDB connection
-const PORT = process.env.PORT || 5000;
 
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/meterflow', {
   useNewUrlParser: true,
