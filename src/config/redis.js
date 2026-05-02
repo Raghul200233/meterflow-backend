@@ -1,42 +1,37 @@
-const Redis = require('ioredis');
-
-let redis;
-let redisAvailable = false;
-
-// In-memory fallback store
 const memoryStore = new Map();
 const rateLimitStore = new Map();
 
-async function initRedis() {
-  try {
-    redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-      retryStrategy: (times) => {
-        if (times > 3) {
-          console.log('⚠️ Redis not available, using in-memory fallback');
-          return null;
-        }
-        return Math.min(times * 100, 1000);
-      },
-      maxRetriesPerRequest: 1,
-    });
+function getRedis() {
+  const redis = global.redisClient || null;
+  const redisAvailable = global.redisAvailable || false;
 
-    await redis.ping();
-    redisAvailable = true;
-    console.log('✅ Redis connected');
-  } catch (error) {
-    console.log('⚠️ Redis unavailable, using in-memory fallback');
-    redisAvailable = false;
+  if (!redisAvailable) {
   }
-  
-  return { redis, redisAvailable, memoryStore, rateLimitStore };
+
+  return {
+    redis,
+    redisAvailable,
+    memoryStore,
+    rateLimitStore
+  };
 }
 
-// Get Redis client (or fallback)
-async function getRedis() {
-  if (!redis) {
-    await initRedis();
-  }
-  return { redis, redisAvailable, memoryStore, rateLimitStore };
+function clearMemoryCache() {
+  memoryStore.clear();
+  rateLimitStore.clear();
 }
 
-module.exports = { initRedis, getRedis };
+function getMemoryStats() {
+  return {
+    cacheSize: memoryStore.size,
+    rateLimitEntries: rateLimitStore.size
+  };
+}
+
+module.exports = {
+  getRedis,
+  memoryStore,
+  rateLimitStore,
+  clearMemoryCache,
+  getMemoryStats
+};
